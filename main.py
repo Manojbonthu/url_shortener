@@ -1,0 +1,154 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import RedirectResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, HttpUrl
+from datetime import datetime
+import random
+import string
+import os
+
+app = FastAPI(
+    title="URL Shortener API",
+    description="A FastAPI URL Shortener that creates short links, redirects, and tracks usage stats.",
+    version="1.0.0"
+)
+
+# ─── Allow frontend (index.html) to talk to the API ──────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─── In-memory storage ────────────────────────────────────────────────────────
+url_store = {}
+stats_store = {}
+
+
+# ─── Models ───────────────────────────────────────────────────────────────────
+class URLRequest(BaseModel):
+    url: HttpUrl
+
+class URLResponse(BaseModel):
+    short_code: str
+    short_url: str
+    original_url: str
+    created_at: str
+
+class StatsResponse(BaseModel):
+    short_code: str
+    original_url: str
+    times_accessed: int
+    created_at: str
+    last_accessed: str | None
+
+
+# ─── Helper ───────────────────────────────────────────────────────────────────
+def generate_short_code(length: int = 7) -> str:
+    characters = string.ascii_letters + string.digits
+    while True:
+        code = ''.join(random.choices(characters, k=length))
+        if code not in url_store:
+            return code
+
+
+# ─── Serve index.html at root ────────────────────────────────────────────────
+@app.get("/", tags=["Home"])
+def home():
+    # Gets the folder where main.py is located and finds index.html there
+    file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+    return FileResponse(file_path, media_type="text/html")
+
+
+# ─── 1. POST /shorten ─────────────────────────────────────────────────────────
+@app.post("/shorten", response_model=URLResponse, tags=["URL Shortener"])
+def shorten_url(request: URLRequest):
+    original_url = str(request.url)
+
+    # Return existing short code if URL already exists
+    for code, stored_url in url_store.items():
+        if stored_url == original_url:
+            return {
+                "short_code": code,
+                "short_url": f"http://127.0.0.1:8000/{code}",
+                "original_url": original_url,
+                "created_at": stats_store[code]["created_at"]
+            }
+
+    short_code = generate_short_code()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    url_store[short_code] = original_url
+    stats_store[short_code] = {
+        "count": 0,
+        "created_at": now,
+        "last_accessed": None
+    }
+
+    return {
+        "short_code": short_code,
+        "short_url": f"http://127.0.0.1:8000/{short_code}",
+        "original_url": original_url,
+        "created_at": now
+    }
+
+
+# ─── 2. GET /stats/{short_code} — must come BEFORE /{short_code} ─────────────
+@app.get("/stats/{short_code}", response_model=StatsResponse, tags=["Analytics"])
+def get_stats(short_code: str):
+    if short_code not in url_store:
+        raise HTTPException(status_code=404, detail=f"Short code '{short_code}' not found.")
+
+    data = stats_store[short_code]
+    return {
+        "short_code": short_code,
+        "original_url": url_store[short_code],
+        "times_accessed": data["count"],
+        "created_at": data["created_at"],
+        "last_accessed": data["last_accessed"]
+    }
+
+
+# ─── 3. GET /all ─────────────────────────────────────────────────────────────
+@app.get("/all", tags=["Analytics"])
+def get_all_urls():
+    if not url_store:
+        return {"message": "No URLs have been shortened yet."}
+
+    result = []
+    for code, original_url in url_store.items():
+        result.append({
+            "short_code": code,
+            "short_url": f"http://127.0.0.1:8000/{code}",
+            "original_url": original_url,
+            "times_accessed": stats_store[code]["count"],
+            "created_at": stats_store[code]["created_at"],
+            "last_accessed": stats_store[code]["last_accessed"]
+        })
+
+    return {"total": len(result), "urls": result}
+
+
+# ─── 4. DELETE /delete/{short_code} ──────────────────────────────────────────
+@app.delete("/delete/{short_code}", tags=["URL Shortener"])
+def delete_short_url(short_code: str):
+    if short_code not in url_store:
+        raise HTTPException(status_code=404, detail=f"Short code '{short_code}' not found.")
+
+    del url_store[short_code]
+    del stats_store[short_code]
+
+    return {"message": f"Short code '{short_code}' has been deleted successfully."}
+
+
+# ─── 5. GET /{short_code} — keep LAST to avoid route conflicts ───────────────
+@app.get("/{short_code}", tags=["URL Shortener"])
+def redirect_to_original(short_code: str):
+    if short_code not in url_store:
+        raise HTTPException(status_code=404, detail=f"Short code '{short_code}' not found.")
+
+    stats_store[short_code]["count"] += 1
+    stats_store[short_code]["last_accessed"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    return RedirectResponse(url=url_store[short_code])
